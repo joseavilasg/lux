@@ -1,10 +1,14 @@
 package youtube
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/kkdai/youtube/v2"
 	"github.com/pkg/errors"
@@ -26,13 +30,78 @@ type extractor struct {
 	client *youtube.Client
 }
 
+type youtubeTransport struct {
+	base    http.RoundTripper
+	headers map[string]string
+}
+
+func (t *youtubeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	for key, value := range t.headers {
+		req.Header.Set(key, value)
+	}
+	return t.base.RoundTrip(req)
+}
+
+func getVisitorId() (string, error) {
+	const sep = "\nytcfg.set("
+	req, err := http.NewRequest("GET", "https://www.youtube.com", nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to perform request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	_, ytcnf, found := strings.Cut(string(data), sep)
+	if !found {
+		return "", fmt.Errorf("separator not found in response")
+	}
+
+	var value struct {
+		InnertubeContext struct {
+			Client struct {
+				VisitorData string `json:"visitorData"`
+			} `json:"client"`
+		} `json:"INNERTUBE_CONTEXT"`
+	}
+
+	if err := json.NewDecoder(strings.NewReader(ytcnf)).Decode(&value); err != nil {
+		return "", fmt.Errorf("failed to decode JSON: %w", err)
+	}
+
+	visitor, err := url.PathUnescape(value.InnertubeContext.Client.VisitorData)
+	if err != nil {
+		return "", fmt.Errorf("failed to unescape visitor data: %w", err)
+	}
+
+	return visitor, nil
+}
+
 // New returns a youtube extractor.
 func New() extractors.Extractor {
+	visitorId, err := getVisitorId()
+	if err != nil {
+		panic(fmt.Sprintf("failed to get visitorId: %v", err))
+	}
+
 	return &extractor{
 		client: &youtube.Client{
 			HTTPClient: &http.Client{
-				Transport: &http.Transport{
-					Proxy: http.ProxyFromEnvironment,
+				Transport: &youtubeTransport{
+					base: &http.Transport{
+						Proxy: http.ProxyFromEnvironment,
+					},
+					headers: map[string]string{
+						"x-goog-visitor-id": visitorId,
+					},
 				},
 			},
 		},
